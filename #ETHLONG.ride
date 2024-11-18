@@ -1,0 +1,132 @@
+{-# STDLIB_VERSION 6 #-}
+{-# CONTENT_TYPE DAPP #-}
+{-# SCRIPT_TYPE ACCOUNT #-}
+{-# IMPORT artifacts/mainnet.ride #-}
+
+let VERSION = "LE-0.0.7"
+
+let Scale16 = 10000000000000000
+
+let market = Address(base58'3P4uA5etnZi4AmBabKinq2bMiWU8KcnHZdH')
+let supplyTokenStr = "3VuV5WTmDz47Dmdn3QpcYjzbSdipjQE4JMdNe1xZpX13"
+let borrowTokenStr = "9wc3LXNA4TEBsXyKtoLE9mrbDD7WMHXvXrCjZvabLAsi"
+
+func getAssetString(assetId: ByteVector|Unit) = {
+  match assetId {
+    case b:ByteVector => b.toBase58String()
+    case _ => "WAVES"
+  }
+}
+
+func getAssetBytes(assetIdStr: String) = {
+  if (assetIdStr == "WAVES") then {unit} else {assetIdStr.fromBase58String()}
+}
+
+func getRates() = {
+  strict rates = invoke(market, "calculateTokenRates", [false], [])
+  rates.exactAs[String]
+}
+
+func getRate(rates: String, assetStr: String, rateType: String) = {
+  strict rateNum = if rateType == "bRate" then 0 else 1
+  strict assetNum = getStringValue(market, "setup_tokens").split(",").indexOf(assetStr).value()
+  rates.split(",")[assetNum].value().split("|")[rateNum].parseIntValue()
+}
+
+func getCurrentSupply(rates: String) = {
+  strict supply = getIntegerValue(market, this.toString()+"_supplied_"+supplyTokenStr)
+  strict rate = getRate(rates, supplyTokenStr, "sRate")
+  fraction(supply, rate, Scale16)
+}
+
+func getCurrentBorrow(rates: String) = {
+  strict borrow = getIntegerValue(market, this.toString()+"_borrowed_"+borrowTokenStr)
+  strict rate = getRate(rates, borrowTokenStr, "bRate")
+  fraction(borrow, rate, Scale16)
+}
+
+@Callable(i)
+func init() = {
+  if (i.caller != this) then {throw("self invoke only")}
+  else if (getString("setup_lpid") != unit) then {throw("already initialized")}
+  else {
+    let issue = Issue("#ETHLONG", "#ETHLONG", 0, 8, true)
+    [
+      StringEntry("setup_lpid", issue.calculateAssetId().getAssetString()),
+      issue
+    ]
+  }
+}
+
+@Callable(i)
+func getSupplyAndBorrow(toSupply: Int) = {
+    strict rates = getRates()
+    strict supply = getCurrentSupply(rates)
+    strict borrow = getCurrentBorrow(rates)
+    strict toBorrow = fraction(toSupply, borrow, supply)
+
+    throw(supply.toString() + ", " + borrow.toString() + ", " + toSupply.toString() + ", " + toBorrow.toString())
+}
+
+@Callable(i)
+func mintV1() = {
+  let pmt = i.payments[0]
+
+  if (pmt.assetId.getAssetString() != supplyTokenStr) then {throw("attach supply token as payment")}
+  else {
+    strict rates = getRates()
+    strict supply = getCurrentSupply(rates)
+    strict borrow = getCurrentBorrow(rates)
+
+    strict toSupply = pmt.amount
+    strict toBorrow = fraction(toSupply, borrow, supply)
+
+    strict inv1 = invoke(market, "supply", [], [i.payments[0]])
+    strict inv2 = invoke(market, "borrow", [borrowTokenStr, toBorrow], [])
+
+    let lpIdStr = getStringValue(this, "setup_lpid")
+    let lpId = lpIdStr.fromBase58String()
+    let reissue = Reissue(lpId, toSupply, true)
+
+    [
+      reissue,
+      ScriptTransfer(i.caller, toSupply, lpId),
+      ScriptTransfer(i.caller, toBorrow-1, borrowTokenStr.getAssetBytes())
+    ]
+  }
+}
+
+
+@Callable(i)
+func redeemV1() = {
+  let lpIdStr = getStringValue(this, "setup_lpid")
+  let lpId = lpIdStr.fromBase58String()
+
+  let pmt1 = i.payments[0].value() # LP
+  let pmt2 = i.payments[1].value() # borrow
+
+
+  if (!(pmt1.assetId == lpId && pmt2.assetId.getAssetString() == borrowTokenStr)) then {throw("attach lp & borrow tokens as payment")}
+  else {
+    strict rates = getRates()
+    strict supply = getCurrentSupply(rates)
+    strict borrow = getCurrentBorrow(rates)
+
+    let borrowEquivalent = fraction(pmt1.amount, borrow, supply)
+    let borrowReturn = min([borrowEquivalent, pmt2.amount])
+
+    let usedLP = fraction(borrowReturn, supply, borrow)
+    let usedRepay = borrowReturn
+
+    strict inv1 = invoke(market, "repay", [], [AttachedPayment(borrowTokenStr.getAssetBytes(), usedRepay)])
+    strict inv2 = invoke(market, "withdraw", [supplyTokenStr, usedLP], [])
+
+    [
+      Burn(lpId, usedLP),
+
+      ScriptTransfer(i.caller, usedLP - 1, supplyTokenStr.getAssetBytes()),
+      ScriptTransfer(i.caller, pmt1.amount - usedLP, lpId),
+      ScriptTransfer(i.caller, pmt2.amount - usedRepay, borrowTokenStr.getAssetBytes())
+    ]
+  }
+} 
